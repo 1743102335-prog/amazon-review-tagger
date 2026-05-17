@@ -73,7 +73,33 @@ def generate_tags(reviews: list[dict], client: DeepSeekClient) -> list[dict]:
     return tags
 
 
-# ==================== 打标（按维度分组） ====================
+# ==================== 四轮维度打标 ====================
+
+# 四轮顺序：场景+人群 → 优点+动机 → 痛点+缺点 → 建议
+DIMENSION_ROUNDS = [
+    ("使用场景 + 目标人群", ["使用场景", "目标人群"]),
+    ("产品优点 + 购买动机", ["产品优点", "购买动机"]),
+    ("用户痛点 + 产品缺点", ["用户痛点", "产品缺点"]),
+    ("使用建议", ["使用建议"]),
+]
+
+def _group_tags_by_rounds(tags: list[dict]) -> list[tuple[str, list[dict]]]:
+    """将标签按四轮维度分组，返回 [(轮次名, 标签列表), ...]"""
+    from collections import defaultdict
+    cat_map = defaultdict(list)
+    for t in tags:
+        cat_map[t.get("category", "未分类")].append(t)
+
+    rounds = []
+    for round_name, categories in DIMENSION_ROUNDS:
+        round_tags = []
+        for cat in categories:
+            if cat in cat_map:
+                round_tags.extend(cat_map[cat])
+        if round_tags:  # 只添加有标签的轮次
+            rounds.append((round_name, round_tags))
+    return rounds
+
 
 def _group_tags_by_category(tags: list[dict]) -> dict[str, list[dict]]:
     """将标签按 category 分组"""
@@ -166,25 +192,21 @@ def _process_one_dimension(batch, tags, client, model):
         return []
 
 
-def _process_batches(reviews: list[dict], tags: list[dict],
-                     client: DeepSeekClient, prompt_builder,
-                     progress_callback=None, stop_check=None,
-                     model: str = None) -> list[dict]:
-    """分批 + 并发打标签（全部标签一次发送，依靠 rich criteria 区分边界）"""
-    if model is None:
-        model = DEEPSEEK_MODEL_TAGGING
-
+def _process_one_round(reviews: list[dict], tags: list[dict],
+                       client: DeepSeekClient, model: str,
+                       round_label: str, round_idx: int, total_rounds: int,
+                       progress_callback=None, stop_check=None) -> None:
+    """处理一轮打标：所有评论 x 该轮标签"""
     total = len(reviews)
     tag_dict = {t["name"]: t for t in tags}
 
-    # 构建所有批次
     all_batches = []
     for batch_start in range(0, total, BATCH_SIZE):
         batch = reviews[batch_start:batch_start + BATCH_SIZE]
         all_batches.append((batch_start, batch))
 
     def process_one_batch(batch, _tags):
-        system_prompt, user_prompt = prompt_builder(batch, _tags)
+        system_prompt, user_prompt = build_tagging_prompt(batch, _tags)
         try:
             response = client.chat(system_prompt, user_prompt, model=model)
             data = safe_json_parse(response)
@@ -192,11 +214,10 @@ def _process_batches(reviews: list[dict], tags: list[dict],
         except Exception:
             return []
 
-    # 分轮次并发
     batch_idx = 0
     while batch_idx < len(all_batches):
         if stop_check and stop_check():
-            break
+            return
 
         round_batches = all_batches[batch_idx:batch_idx + CONCURRENCY]
         batch_idx += len(round_batches)
@@ -204,7 +225,6 @@ def _process_batches(reviews: list[dict], tags: list[dict],
         with concurrent.futures.ThreadPoolExecutor(max_workers=len(round_batches)) as executor:
             futures = {}
             for bs, batch in round_batches:
-                # 初始化
                 for r in batch:
                     r.setdefault("tags", [])
                 future = executor.submit(process_one_batch, batch, tags)
@@ -218,23 +238,12 @@ def _process_batches(reviews: list[dict], tags: list[dict],
                 except Exception:
                     pass
 
-        # 标记未打标
-        for bs, batch in round_batches:
-            for r in batch:
-                if not r["tags"]:
-                    r["is_uncertain"] = True
-                    r["confidence"] = "low"
-                else:
-                    r["is_uncertain"] = False
-
         if progress_callback:
-            done_count = sum(1 for r in reviews if r.get("confidence") or r.get("is_uncertain"))
-            progress_callback(min(done_count, total), total)
+            global_done = sum(1 for r in reviews if r.get("confidence") or r.get("is_uncertain"))
+            progress_callback(min(global_done, total), total,
+                            round_label, round_idx, total_rounds)
 
-    if progress_callback:
-        progress_callback(total, total)
-
-    return reviews
+    # 本轮完成，未打标的暂时不动（等所有轮次结束后再标记）
 
 
 # ==================== 公开接口 ====================
@@ -242,21 +251,52 @@ def _process_batches(reviews: list[dict], tags: list[dict],
 def tag_reviews_batch(reviews: list[dict], tags: list[dict],
                       client: DeepSeekClient,
                       progress_callback=None, stop_check=None) -> list[dict]:
-    """一阶段打标签（按维度分组）"""
-    return _process_batches(reviews, tags, client, build_tagging_prompt,
-                            progress_callback, stop_check)
+    """四轮维度打标：每轮只用对应维度的标签，合并所有轮次结果"""
+    rounds = _group_tags_by_rounds(tags)
+    model = DEEPSEEK_MODEL_TAGGING
+
+    for round_idx, (round_name, round_tags) in enumerate(rounds):
+        if stop_check and stop_check():
+            break
+        _process_one_round(reviews, round_tags, client, model,
+                          round_name, round_idx + 1, len(rounds),
+                          progress_callback, stop_check)
+
+    # 全部轮次结束后统一标记未打标
+    for r in reviews:
+        if not _get_tag_names(r):
+            r["is_uncertain"] = True
+            r["confidence"] = "low"
+
+    if progress_callback:
+        total = len(reviews)
+        progress_callback(total, total, "完成", len(rounds), len(rounds))
+
+    return reviews
 
 
 def retag_uncertain(reviews: list[dict], tags: list[dict],
                     client: DeepSeekClient,
                     progress_callback=None, stop_check=None) -> int:
-    """二阶段补标"""
+    """二阶段补标：对未打标评论按四轮重新处理"""
     untagged = [r for r in reviews if not _get_tag_names(r)]
     if not untagged:
         return 0
 
-    _process_batches(untagged, tags, client, build_retagging_prompt,
-                     progress_callback, stop_check)
+    rounds = _group_tags_by_rounds(tags)
+    model = DEEPSEEK_MODEL_TAGGING
+
+    for round_idx, (round_name, round_tags) in enumerate(rounds):
+        if stop_check and stop_check():
+            break
+        _process_one_round(untagged, round_tags, client, model,
+                          round_name, round_idx + 1, len(rounds),
+                          progress_callback, stop_check)
+
+    for r in untagged:
+        if not _get_tag_names(r):
+            r["is_uncertain"] = True
+            r["confidence"] = "low"
 
     return sum(1 for r in untagged if not r.get("is_uncertain", True))
 

@@ -33,6 +33,8 @@ def init_session():
         "retag_round": 0,
         "retag_last_count": 0,
         "manual_tags": [],
+        "deleted_tags": set(),
+        "merge_actions": [],
         "uncertain_resolved": False,
     }
     for key, val in defaults.items():
@@ -393,9 +395,71 @@ def render_step_2():
             "触发词": "、".join(mt.get("trigger_keywords", [])),
         })
 
+    # -------- 删除/合并标签 --------
+    with st.expander("🗑️ 删除或合并标签", expanded=False):
+        all_tag_names = [row["标签名"] for _, row in edited_df.iterrows()]
+
+        # 删除标签
+        st.markdown("**删除标签**")
+        del_col1, del_col2 = st.columns([3, 1])
+        with del_col1:
+            tag_to_delete = st.selectbox("选择要删除的标签", [""] + all_tag_names, key="del_tag")
+        with del_col2:
+            if st.button("🗑️ 删除", key="del_btn") and tag_to_delete:
+                st.session_state["deleted_tags"] = st.session_state.get("deleted_tags", set())
+                st.session_state["deleted_tags"].add(tag_to_delete)
+                st.success(f"已删除「{tag_to_delete}」")
+                st.rerun()
+
+        st.divider()
+
+        # 合并标签
+        st.markdown("**合并相似标签**")
+        merge_col1, merge_col2, merge_col3 = st.columns(3)
+        with merge_col1:
+            tag_a = st.selectbox("标签A", [""] + [n for n in all_tag_names
+                                    if n not in st.session_state.get("deleted_tags", set())], key="merge_a")
+        with merge_col2:
+            tag_b = st.selectbox("标签B", [""] + [n for n in all_tag_names
+                                    if n not in st.session_state.get("deleted_tags", set())], key="merge_b")
+        with merge_col3:
+            new_merged_name = st.text_input("新标签名（合并后）", placeholder="输入合并后的新标签名", key="merged_name")
+
+        if st.button("🔀 合并标签", key="merge_btn") and tag_a and tag_b and tag_a != tag_b and new_merged_name:
+            st.session_state["merge_actions"] = st.session_state.get("merge_actions", [])
+            st.session_state["merge_actions"].append((tag_a, tag_b, new_merged_name))
+            st.session_state["deleted_tags"] = st.session_state.get("deleted_tags", set())
+            st.session_state["deleted_tags"].add(tag_a)
+            st.session_state["deleted_tags"].add(tag_b)
+            # 找出被合并标签的信息生成新标签
+            old_a = next((t for t in tags if t["name"] == tag_a), {})
+            old_b = next((t for t in tags if t["name"] == tag_b), {})
+            st.session_state["manual_tags"] = st.session_state.get("manual_tags", [])
+            st.session_state["manual_tags"].append({
+                "id": f"tag_merged_{len(st.session_state['merge_actions']):03d}",
+                "category": old_a.get("category", old_b.get("category", "未分类")),
+                "name": new_merged_name,
+                "description": f"由「{tag_a}」和「{tag_b}」合并",
+                "criteria": f"{old_a.get('criteria','')}；{old_b.get('criteria','')}",
+                "trigger_keywords": list(set(
+                    old_a.get("trigger_keywords", []) + old_b.get("trigger_keywords", [])
+                )),
+                "positive_examples": old_a.get("positive_examples", []) + old_b.get("positive_examples", []),
+                "negative_examples": old_a.get("negative_examples", []) + old_b.get("negative_examples", []),
+            })
+            st.success(f"「{tag_a}」+「{tag_b}」已合并为「{new_merged_name}」")
+            st.rerun()
+
+    # 过滤被删除的标签
+    deleted = st.session_state.get("deleted_tags", set())
+    if deleted:
+        edit_data = [row for row in edit_data if row["标签名"] not in deleted]
+
     col1, col2 = st.columns(2)
     with col1:
         if st.button("← 返回上一步"):
+            st.session_state["deleted_tags"] = set()
+            st.session_state["merge_actions"] = []
             go_to_step(1)
     with col2:
         if st.button("✅ 确认标签，开始打标签", type="primary", use_container_width=True):
@@ -497,12 +561,18 @@ def render_step_3():
                 st.session_state["stop_tagging"] = True
                 st.rerun()
 
-        def update_progress(done, _total):
+        def update_progress(done, _total, round_label="", round_idx=0, total_rounds=0):
             pct = min(done / max(total_reviews, 1), 1.0)
-            progress_bar.progress(pct, f"已处理: {min(done, total_reviews)}/{total_reviews}")
+            round_info = f"第{round_idx}/{total_rounds}轮「{round_label}」" if round_label else ""
+            progress_bar.progress(pct, f"{round_info} 已处理: {min(done, total_reviews)}/{total_reviews}")
             tagged_count = sum(1 for r in reviews if _get_tag_names(r))
-            uncertain_count = sum(1 for r in reviews if r.get("is_uncertain"))
-            status_text.text(f"进度: {min(done,total_reviews)}/{total_reviews} | 已打标: {tagged_count} | 不确定: {uncertain_count} | V4 Pro精准模式")
+            uncertain_count = sum(1 for r in reviews if not _get_tag_names(r) and r.get("is_uncertain"))
+            status_text.text(
+                f"{round_info} | "
+                f"进度: {min(done, total_reviews)}/{total_reviews} | "
+                f"已打标: {tagged_count} | "
+                f"未打标: {uncertain_count}"
+            )
 
         try:
             from src.tag_engine import tag_reviews_batch as do_batch
@@ -584,11 +654,12 @@ def render_step_3():
             progress_bar = st.progress(0, "补标中...")
             status_text = st.empty()
 
-            def retag_progress(done, _total):
+            def retag_progress(done, _total, round_label="", round_idx=0, total_rounds=0):
                 pct = min(done / max(uncertain, 1), 1.0)
-                progress_bar.progress(pct, f"第{retag_round}轮补标: {min(done, uncertain)}/{uncertain}")
+                round_info = f"第{round_idx}/{total_rounds}轮「{round_label}」" if round_label else ""
+                progress_bar.progress(pct, f"补标 {round_info}: {min(done, uncertain)}/{uncertain}")
                 new_tagged = sum(1 for r in reviews if _get_tag_names(r))
-                status_text.text(f"总共已打标: {new_tagged}/{total_reviews} ({new_tagged*100//max(total_reviews,1)}%)")
+                status_text.text(f"补标中... 总共已打标: {new_tagged}/{total_reviews} ({new_tagged*100//max(total_reviews,1)}%)")
 
             client = get_client()
             from src.tag_engine import retag_uncertain
