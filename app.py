@@ -399,55 +399,59 @@ def render_step_2():
     with st.expander("🗑️ 删除或合并标签", expanded=False):
         all_tag_names = [row["标签名"] for _, row in edited_df.iterrows()]
 
-        # 删除标签
-        st.markdown("**删除标签**")
-        del_col1, del_col2 = st.columns([3, 1])
-        with del_col1:
-            tag_to_delete = st.selectbox("选择要删除的标签", [""] + all_tag_names, key="del_tag")
-        with del_col2:
-            if st.button("🗑️ 删除", key="del_btn") and tag_to_delete:
-                st.session_state["deleted_tags"] = st.session_state.get("deleted_tags", set())
-                st.session_state["deleted_tags"].add(tag_to_delete)
-                st.success(f"已删除「{tag_to_delete}」")
-                st.rerun()
+        # 批量删除标签
+        st.markdown("**批量删除标签**")
+        tags_to_delete = st.multiselect("选择要删除的标签（可多选）", all_tag_names, key="del_tags")
+        if st.button("🗑️ 删除选中标签", key="del_btn") and tags_to_delete:
+            st.session_state["deleted_tags"] = st.session_state.get("deleted_tags", set())
+            for t in tags_to_delete:
+                st.session_state["deleted_tags"].add(t)
+            st.success(f"已删除 {len(tags_to_delete)} 个标签：{'、'.join(tags_to_delete)}")
+            st.rerun()
 
         st.divider()
 
-        # 合并标签
-        st.markdown("**合并相似标签**")
-        merge_col1, merge_col2, merge_col3 = st.columns(3)
-        with merge_col1:
-            tag_a = st.selectbox("标签A", [""] + [n for n in all_tag_names
-                                    if n not in st.session_state.get("deleted_tags", set())], key="merge_a")
-        with merge_col2:
-            tag_b = st.selectbox("标签B", [""] + [n for n in all_tag_names
-                                    if n not in st.session_state.get("deleted_tags", set())], key="merge_b")
-        with merge_col3:
-            new_merged_name = st.text_input("新标签名（合并后）", placeholder="输入合并后的新标签名", key="merged_name")
+        # 批量合并标签
+        st.markdown("**批量合并标签**")
+        available = [n for n in all_tag_names if n not in st.session_state.get("deleted_tags", set())]
+        tags_to_merge = st.multiselect("选择要合并的标签（可多选，≥2个）", available, key="merge_tags")
+        new_merged_name = st.text_input("合并后的新标签名", placeholder="输入合并后的新标签名", key="merged_name")
 
-        if st.button("🔀 合并标签", key="merge_btn") and tag_a and tag_b and tag_a != tag_b and new_merged_name:
+        if st.button("🔀 合并选中标签", key="merge_btn") and len(tags_to_merge) >= 2 and new_merged_name:
             st.session_state["merge_actions"] = st.session_state.get("merge_actions", [])
-            st.session_state["merge_actions"].append((tag_a, tag_b, new_merged_name))
+            st.session_state["merge_actions"].append((tags_to_merge, new_merged_name))
             st.session_state["deleted_tags"] = st.session_state.get("deleted_tags", set())
-            st.session_state["deleted_tags"].add(tag_a)
-            st.session_state["deleted_tags"].add(tag_b)
-            # 找出被合并标签的信息生成新标签
-            old_a = next((t for t in tags if t["name"] == tag_a), {})
-            old_b = next((t for t in tags if t["name"] == tag_b), {})
+            for t in tags_to_merge:
+                st.session_state["deleted_tags"].add(t)
+
+            # 聚合所有被合并标签的信息
+            merged_criteria = []
+            merged_keywords = set()
+            merged_pos = []
+            merged_neg = []
+            merged_cat = "未分类"
+            for tname in tags_to_merge:
+                old = next((t for t in tags if t["name"] == tname), {})
+                if old.get("category"):
+                    merged_cat = old["category"]
+                if old.get("criteria"):
+                    merged_criteria.append(old["criteria"])
+                merged_keywords.update(old.get("trigger_keywords", []))
+                merged_pos.extend(old.get("positive_examples", []))
+                merged_neg.extend(old.get("negative_examples", []))
+
             st.session_state["manual_tags"] = st.session_state.get("manual_tags", [])
             st.session_state["manual_tags"].append({
                 "id": f"tag_merged_{len(st.session_state['merge_actions']):03d}",
-                "category": old_a.get("category", old_b.get("category", "未分类")),
+                "category": merged_cat,
                 "name": new_merged_name,
-                "description": f"由「{tag_a}」和「{tag_b}」合并",
-                "criteria": f"{old_a.get('criteria','')}；{old_b.get('criteria','')}",
-                "trigger_keywords": list(set(
-                    old_a.get("trigger_keywords", []) + old_b.get("trigger_keywords", [])
-                )),
-                "positive_examples": old_a.get("positive_examples", []) + old_b.get("positive_examples", []),
-                "negative_examples": old_a.get("negative_examples", []) + old_b.get("negative_examples", []),
+                "description": f"由 {'、'.join(tags_to_merge)} 合并",
+                "criteria": "；".join(merged_criteria),
+                "trigger_keywords": list(merged_keywords),
+                "positive_examples": merged_pos,
+                "negative_examples": merged_neg,
             })
-            st.success(f"「{tag_a}」+「{tag_b}」已合并为「{new_merged_name}」")
+            st.success(f"{len(tags_to_merge)} 个标签已合并为「{new_merged_name}」")
             st.rerun()
 
     # 过滤被删除的标签
