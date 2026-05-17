@@ -7,13 +7,20 @@ def safe_json_parse(text: str) -> dict:
     if not text:
         return {}
 
-    # 尝试直接解析
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        pass
+    # 先清理 DeepSeek thinking 模型可能包裹的标签
+    cleaned = text
+    cleaned = re.sub(r'<thinking>.*?</thinking>', '', cleaned, flags=re.DOTALL)
+    cleaned = re.sub(r'<reasoning>.*?</reasoning>', '', cleaned, flags=re.DOTALL)
+    cleaned = re.sub(r'<thought>.*?</thought>', '', cleaned, flags=re.DOTALL)
 
-    # 尝试提取 ```json ... ``` 代码块
+    # 尝试直接解析
+    for candidate in [cleaned, text]:
+        try:
+            return json.loads(candidate)
+        except json.JSONDecodeError:
+            pass
+
+    # 提取 ```json ... ```
     match = re.search(r'```json\s*(.*?)\s*```', text, re.DOTALL)
     if match:
         try:
@@ -21,7 +28,7 @@ def safe_json_parse(text: str) -> dict:
         except json.JSONDecodeError:
             pass
 
-    # 尝试提取 ``` ... ``` 代码块
+    # 提取 ``` ... ```
     match = re.search(r'```\s*(.*?)\s*```', text, re.DOTALL)
     if match:
         try:
@@ -29,7 +36,7 @@ def safe_json_parse(text: str) -> dict:
         except json.JSONDecodeError:
             pass
 
-    # 尝试提取第一个 { 到最后一个 }
+    # 提取第一个 { 到最后一个 }
     match = re.search(r'\{.*\}', text, re.DOTALL)
     if match:
         try:
@@ -41,12 +48,10 @@ def safe_json_parse(text: str) -> dict:
 
 
 def extract_json_array(text: str) -> list:
-    """安全提取 JSON 数组"""
     result = safe_json_parse(text)
     if isinstance(result, list):
         return result
     if isinstance(result, dict):
-        # 尝试从 dict 中提取第一个数组值
         for val in result.values():
             if isinstance(val, list):
                 return val
@@ -54,7 +59,6 @@ def extract_json_array(text: str) -> list:
 
 
 def truncate_text(text: str, max_length: int = 800) -> str:
-    """截断文本到指定长度"""
     if not text or len(text) <= max_length:
         return text or ""
     return text[:max_length] + "..."

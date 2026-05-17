@@ -21,8 +21,20 @@ def generate_tags(reviews: list[dict], client: DeepSeekClient) -> list[dict]:
     sampled_text = "\n\n".join(lines)
 
     system_prompt, user_prompt = build_tag_generation_prompt(sampled_text)
-    response = client.chat(system_prompt, user_prompt,
-                           model=DEEPSEEK_MODEL_TAG_GEN)
+
+    # 先用 V4 Pro，失败则降级到 V4 Flash
+    response = None
+    last_error = None
+    for model_try in [DEEPSEEK_MODEL_TAG_GEN, DEEPSEEK_MODEL_TAGGING]:
+        try:
+            response = client.chat(system_prompt, user_prompt, model=model_try)
+            break
+        except Exception as e:
+            last_error = e
+            continue
+
+    if response is None:
+        raise RuntimeError(f"所有模型生成标签均失败: {last_error}")
 
     data = safe_json_parse(response)
     raw_tags = data.get("tags", [])
@@ -36,13 +48,26 @@ def generate_tags(reviews: list[dict], client: DeepSeekClient) -> list[dict]:
             continue
         tags.append({
             "id": t.get("id", f"tag_{i:03d}"),
-            "category": t.get("category", "未分类").strip(),
+            "category": _safe_str(t.get("category"), "未分类"),
             "name": name,
-            "description": t.get("description", "").strip(),
-            "criteria": t.get("criteria", "").strip(),
-            "trigger_keywords": t.get("trigger_keywords", []),
-            "positive_examples": t.get("positive_examples", []),
-            "negative_examples": t.get("negative_examples", []),
+            "description": _safe_str(t.get("description")),
+            "criteria": _safe_str(t.get("criteria")),
+            "trigger_keywords": _safe_list(t.get("trigger_keywords")),
+            "positive_examples": _safe_list(t.get("positive_examples")),
+            "negative_examples": _safe_list(t.get("negative_examples")),
+        })
+
+    # 如果 0 个标签，返回原始响应供调试
+    if not tags:
+        tags.append({
+            "id": "tag_error",
+            "category": "错误",
+            "name": "标签生成失败",
+            "description": f"API返回了0个标签。原始响应前500字: {response[:500]}",
+            "criteria": "",
+            "trigger_keywords": [],
+            "positive_examples": [],
+            "negative_examples": [],
         })
 
     return tags
@@ -237,6 +262,20 @@ def retag_uncertain(reviews: list[dict], tags: list[dict],
 
 
 # ==================== 工具函数 ====================
+
+def _safe_str(val, default=""):
+    if isinstance(val, str):
+        return val.strip()
+    return default
+
+
+def _safe_list(val):
+    if isinstance(val, list):
+        return [str(x).strip() for x in val if str(x).strip()]
+    if isinstance(val, str):
+        return [x.strip() for x in val.split("\n") if x.strip()]
+    return []
+
 
 def _get_tag_names(review: dict) -> list[str]:
     tags = review.get("tags", [])
