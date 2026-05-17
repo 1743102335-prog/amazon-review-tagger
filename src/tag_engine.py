@@ -22,8 +22,7 @@ def generate_tags(reviews: list[dict], client: DeepSeekClient) -> list[dict]:
 
     system_prompt, user_prompt = build_tag_generation_prompt(sampled_text)
     response = client.chat(system_prompt, user_prompt,
-                           model=DEEPSEEK_MODEL_TAG_GEN,
-                           reasoning_effort="high")
+                           model=DEEPSEEK_MODEL_TAG_GEN)
 
     data = safe_json_parse(response)
     raw_tags = data.get("tags", [])
